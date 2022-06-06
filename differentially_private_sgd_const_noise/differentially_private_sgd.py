@@ -246,7 +246,7 @@ def main(_):
             key, next(itercount), opt_state, shape_as_image(*next(batches)))
     pr.disable()
     if FLAGS.dpsgd:
-      pr.dump_stats(f"private{FLAGS.noise_multiplier}|{FLAGS.l2_norm_clip}|{FLAGS.batch_size}.prof")
+      pr.dump_stats(f"ConstantNoise_private{FLAGS.noise_multiplier}|{FLAGS.l2_norm_clip}|{FLAGS.batch_size}.prof")
     else:
       pr.dump_stats(f"public{FLAGS.noise_multiplier}|{FLAGS.l2_norm_clip}|{FLAGS.batch_size}.prof")
     epoch_time = time.time() - start_time
