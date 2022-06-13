@@ -104,6 +104,8 @@ flags.DEFINE_integer(
     'microbatches', None, 'Number of microbatches '
     '(must evenly divide batch_size)')
 flags.DEFINE_string('model_dir', None, 'Model directory')
+flags.DEFINE_integer(
+    'noise_size', 10, 'Noise size for pre-generation')
 
 pr = cProfile.Profile()
 
@@ -153,11 +155,11 @@ def private_grad(params, batch, rng, l2_norm_clip, noise_multiplier,
   clipped_grads_flat, grads_treedef = tree_flatten(clipped_grads)
   aggregated_clipped_grads = [g.sum(0) for g in clipped_grads_flat]
   rngs = random.split(rng, len(aggregated_clipped_grads))
-  # noised_aggregated_clipped_grads = [
-  #     g + l2_norm_clip * noise_multiplier * 1
-  #     for r, g in zip(rngs, aggregated_clipped_grads)]
+  noised_aggregated_clipped_grads = [
+      g + l2_norm_clip * noise_multiplier * random.normal(r, g.shape)
+      for r, g in zip(rngs, aggregated_clipped_grads)]
   normalized_noised_aggregated_clipped_grads = [
-      g / batch_size for g in aggregated_clipped_grads]
+      g / batch_size for g in noised_aggregated_clipped_grads]
   return tree_unflatten(grads_treedef, normalized_noised_aggregated_clipped_grads)
 
 
@@ -175,13 +177,34 @@ def compute_epsilon(steps, num_examples=60000, target_delta=1e-5):
   eps, _, _ = get_privacy_spent(orders, rdp_const, target_delta=target_delta)
   return eps
 
+# @jax.partial(jax.jit, static_argnums=3)
+def pre_generate_noises(grad_shapes, rng, i):
+  rng = random.fold_in(rng, i)
+  rngs = random.split(rng, len(grad_shapes))
+  noises = []
+  for i in range(FLAGS.noise_size):
+    noises.append([])
+  for r, shape in zip(rngs, grad_shapes):
+    long_noise = random.normal(r, shape)
+    splitted_noises = jax.numpy.split(long_noise, FLAGS.noise_size)
+    for i in range(len(noises)):
+      noises[i].append(jax.lax.collapse(splitted_noises[i], 0, 2))
+
+  return noises
+
+
 
 def main(_):
-  # pr = cProfile.Profile()
   if FLAGS.microbatches:
     raise NotImplementedError(
         'Microbatches < batch size not currently supported'
     )
+
+  grad_shapes = [(FLAGS.noise_size, 8, 8, 1, 16), (FLAGS.noise_size, 1, 1, 1, 16), (FLAGS.noise_size, 4, 4, 16, 32),\
+     (FLAGS.noise_size, 1, 1, 1, 32), (FLAGS.noise_size, 512, 32), (FLAGS.noise_size, 32,), (FLAGS.noise_size, 32, 10),\
+      (FLAGS.noise_size, 10,)]
+  
+
 
   train_images, train_labels, test_images, test_labels = datasets.mnist()
   num_train = train_images.shape[0]
@@ -208,7 +231,7 @@ def main(_):
     return opt_update(i, grad(loss)(params, batch), opt_state)
 
   @jit
-  def private_update(rng, i, opt_state, batch):
+  def private_update(rng, i, opt_state, batch, current_noise):
     # a = time.time()
     # pr.enable()
     params = get_params(opt_state)
@@ -216,7 +239,7 @@ def main(_):
     result = opt_update(
         i,
         private_grad(params, batch, rng, FLAGS.l2_norm_clip,
-                     FLAGS.noise_multiplier, FLAGS.batch_size), opt_state)
+                     FLAGS.noise_multiplier, FLAGS.batch_size, current_noise), opt_state)
     # pr.disable()
     # print("updated time is ", time.time() - a)
     # pr.dump_stats("private_new.prof")
@@ -235,18 +258,21 @@ def main(_):
   for epoch in range(1, FLAGS.epochs + 1):
     start_time = time.time()
     pr.enable()
-    for _ in range(num_batches):
+    for turn in range(num_batches):
       if FLAGS.dpsgd:
+        looper = turn % FLAGS.noise_size
+        if looper == 0:
+          pre_noise = pre_generate_noises(grad_shapes, key, 1) # it is not possible to get current value of itertools
         opt_state = \
             private_update(
                 key, next(itercount), opt_state,
-                shape_as_image(*next(batches), dummy_dim=True))
+                shape_as_image(*next(batches), dummy_dim=True), pre_noise[looper])
       else:
         opt_state = update(
             key, next(itercount), opt_state, shape_as_image(*next(batches)))
     pr.disable()
     if FLAGS.dpsgd:
-      pr.dump_stats(f"CommentOutNoise_private{FLAGS.noise_multiplier}|{FLAGS.l2_norm_clip}|{FLAGS.batch_size}.prof")
+      pr.dump_stats(f"Pregenerate_noise_private{FLAGS.noise_multiplier}|{FLAGS.l2_norm_clip}|{FLAGS.batch_size}|{FLAGS.noise_size}.prof")
     else:
       pr.dump_stats(f"public{FLAGS.noise_multiplier}|{FLAGS.l2_norm_clip}|{FLAGS.batch_size}.prof")
     epoch_time = time.time() - start_time
